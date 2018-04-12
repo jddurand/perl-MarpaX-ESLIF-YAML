@@ -178,8 +178,11 @@ event ^b_break = completed <b break>  # Triggers a START_OF_LINE zero-length lex
 # Indentation Spaces
 # ------------------
 #
-# Parameterized rules are not supported by ESLIF, we use a lexeme
-# to handle the inner loop
+# Parameterized rules are not supported by ESLIF. Indeed this is
+# only because the parameterized rules that YAML grammar
+# looks complex.
+# Anyway it is exactly here that YAML grammar is not context-free
+# so callbacks to user-space are used.
 #
 event ^s_indent_n    = predicted <s indent n>
 event ^s_indent_lt_n = predicted <s indent lt n>
@@ -197,19 +200,42 @@ S_SPACE_LE_N                  ~ [\s\S]             # Matches nothing: callback i
 # Separation Spaces
 # -----------------
 #
+event ^s_separate_in_line    = predicted <s separate in line>
 <s separate in line>        ::= S_WHITE_MANY
                               | START_OF_LINE
 
-S_WHITE_MANY                  ~ [\s\S]             # Matches nothing: callback in user space will fill it, including start_of_line
-START_OF_LINE                 ~ [\s\S]             # START_OF_LINE is a zero-length lexeme automatically trigger when <b break> is completed
+S_WHITE_MANY                  ~ [\s\S]             # Matches nothing: callback in user space will fill it
+START_OF_LINE                 ~ [\s\S]             # START_OF_LINE is a zero-length lexeme automatically triggered when <b break> is completed
 
 # -------------
 # Line Prefixes
 # -------------
+<s line prefix n c>         ::= <s line prefix n block out>
+                              | <s line prefix n block in>
+                              | <s line prefix n flow out>
+                              | <s line prefix n flow in>
+
 <s line prefix n block out> ::= <s block line prefix n>
 <s line prefix n block in>  ::= <s block line prefix n>
 <s line prefix n flow out>  ::= <s flow line prefix n>
 <s line prefix n flow in>   ::= <s flow line prefix n>
+
+# -----------
+# Empty Lines
+# -----------
+<l empty n c>               ::= <s line prefix n c> <b as line feed>
+                              | <s indent lt n>     <b as line feed>
+
+# ------------
+# Line Folding
+# ------------
+<b l trimmed n c>           ::= <b non content> <l empty n c many>
+<l empty n c many>          ::= <l empty n c>+
+<b as space>                ::= <b break>
+<b l folded n c>            ::= <b l trimmed n c>
+                              | <b as space>
+<s flow folded n>           ::= <s separate in line> <b l folded n flow in> <s flow line prefix n>
+                              |                      <b l folded n flow in> <s flow line prefix n>
 
 # --------------------------------------------
 # Lexemes on which user-space callbacks depend
