@@ -1,7 +1,7 @@
 use strict;
 use warnings FATAL => 'all';
 
-package MarpaX::ESLIF::URI::_generic;
+package MarpaX::ESLIF::YAML;
 
 # ABSTRACT: YAML Parser using MarpaX::ESLIF
 
