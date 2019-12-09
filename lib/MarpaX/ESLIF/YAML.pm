@@ -12,346 +12,488 @@ package MarpaX::ESLIF::YAML;
 use Carp qw/croak/;
 use Data::Section -setup;
 use Log::Any qw/$log/;
-use MarpaX::ESLIF;
+use MarpaX::ESLIF 3.0.29;     # if-action uses embedded lua
+use MarpaX::ESLIF::URI 0.005; # tag schema
+use MarpaX::ESLIF::YAML::PreparseRecognizerInterface;
+use MarpaX::ESLIF::YAML::PreparseValueInterface;
+use MarpaX::ESLIF::YAML::RecognizerInterface;
 
 use Log::Log4perl qw/:easy/;
 use Log::Any::Adapter;
-use Log::Any qw/$log/;
+#
+# Init log
+#
 our $defaultLog4perlConf = '
-        log4perl.rootLogger              = TRACE, Screen
-        log4perl.appender.Screen         = Log::Log4perl::Appender::Screen
-        log4perl.appender.Screen.stderr  = 0
-        log4perl.appender.Screen.layout  = PatternLayout
-        log4perl.appender.Screen.layout.ConversionPattern = %d %-5p %6P %m{chomp}%n
-        ';
+log4perl.rootLogger              = INFO, Screen
+log4perl.appender.Screen         = Log::Log4perl::Appender::Screen
+log4perl.appender.Screen.stderr  = 0
+log4perl.appender.Screen.layout  = PatternLayout
+log4perl.appender.Screen.layout.ConversionPattern = %d %-5p %6P %m{chomp}%n
+';
 Log::Log4perl::init(\$defaultLog4perlConf);
 Log::Any::Adapter->set('Log4perl');
 
+# ---------------
+# ESLIF singleton
+# ---------------
 my $ESLIF = MarpaX::ESLIF->new($log);
 
-# -----------------------------------------------
-# Grammar for BOM detection using the first bytes
-# -----------------------------------------------
-my $BOM_SOURCE  = ${__PACKAGE__->section_data('BOM')};
-my $BOM_GRAMMAR = MarpaX::ESLIF::Grammar->new($ESLIF, $BOM_SOURCE);
-
-# ----------------
-# Grammar for YAML
-# ----------------
+# -------------------------
+# Grammar for YAML Preparse
+# -------------------------
 my $YAML_SOURCE  = ${__PACKAGE__->section_data('YAML')};
 my $YAML_GRAMMAR = MarpaX::ESLIF::Grammar->new($ESLIF, $YAML_SOURCE);
 print $YAML_GRAMMAR->show();
 
+sub decode {
+    my ($input) = @_;
+
+    my $recognizerInterface = MarpaX::ESLIF::YAML::RecognizerInterface->new(input => $input);
+    my $valueInterface = MarpaX::ESLIF::YAML::ValueInterface->new();
+
+    return $YAML_GRAMMAR->parse($recognizerInterface, $valueInterface)
+}
+
 1;
 
 __DATA__
-__[ BOM ]__
-#
-# Unusual ordering is not considered
-#
-BOM ::= [\x{00}] [\x{00}] [\x{FE}] [\x{FF}] action => UTF_32BE
-      | [\x{FF}] [\x{FE}] [\x{00}] [\x{00}] action => UTF_32LE
-      | [\x{FE}] [\x{FF}]                   action => UTF_16BE
-      | [\x{FF}] [\x{FE}]                   action => UTF_16LE
-      | [\x{EF}] [\x{BB}] [\x{BF}]          action => UTF_8
-
 __[ YAML ]__
+#
+# Please note that we do NOT need to deal with BOM: ESLIF natively considers BOM
+# when it is character mode.
 #
 # Reference: http://yaml.org/spec/1.2/spec.html
 #
-# --------------------
-# Indicator Characters
-# --------------------
-<c printable>                 ::= [\x{9}\x{A}\x{D}\x{20}-\x{7E}\x{85}\x{A0}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]:u
-<nb json>                     ::= [\x{9}\x{20}-\x{10FFFF}]:u
-<c byte order mark>           ::= [\x{FEFF}]:u
-<c sequence entry>            ::= "-"
-<c mapping key>               ::= "?"
-<c mapping value>             ::= ":"
-<c collect entry>             ::= ","
-<c sequence start>            ::= "["
-<c sequence end>              ::= "]"
-<c mapping start>             ::= "{"
-<c mapping end>               ::= "}"
-<c comment>                   ::= "#"
-<c anchor>                    ::= "&"
-<c alias>                     ::= "*"
-<c tag>                       ::= "!"
-<c literal>                   ::= "|"
-<c folded>                    ::= ">"
-<c single quote>              ::= "'"
-<c double quote>              ::= '"'
-<c directive>                 ::= "%"
-<c reserved>                  ::= [@`]
-<c indicator>                 ::= [-?:,[]{}#&*!|>'"%@`]
-<c flow indicator>            ::= [,[]{}]
+# The order of alternatives inside a production is significant.
+# Subsequent alternatives are only considered when previous ones fails.
+# See for example the b-break production.
+#
+autorank is on by default
 
-# ---------------------
-# Line Break Characters
-# ---------------------
-<b line feed>                 ::= [\x{A}]
-<b carriage return>           ::= [\x{D}]
-<b char>                      ::= <b line feed>
-                                | <b carriage return>
-<nb char>                     ::= [\x{9}\x{20}-\x{7E}\x{85}\x{A0}-\x{D7FF}\x{E000}-\x{FEFE}\x{FF00}\x{FFFD}\x{10000}-\x{10FFFF}]:u # <c printable> - <b char> - <c byte order mark>
-event ^b_break = completed <b break>  # Triggers a START_OF_LINE zero-length lexeme if the later is predicted
-<b break>                     ::= <b carriage return> <b line feed> /* DOS, Windows */
-                                | <b carriage return>               /* MacOS upto 9.x */
-                                | <b line feed>
-<b as line feed>              ::= <b break>
-<b non content>               ::= <b break>
+#
+# How to do parameterized rule ? Suppose we have an RHS that is parameterized, i.e.
+# LHS ::=  r(n, m)
+# We rewrite the rule like this:
+#
+# LHS                    ::= <r NULLABLE n m> <r PARAM n m>
+# event r[n][m]            = nulled <r NULLABLE n m>
+# <r NULLABLE n m>       ::=
+# <r PARAM n m>            ~ [^\s\S] # Matches nothing
+#
+# ==> The end-user will have the event "r[n][m]" that it maps to a function
+#     with name "r", accepting two arguments "n" and "m". The output
+#     of this function will have to be a true value on success, a false value on
+#     failure, and this function will be responsible to inject what the grammar
+#     expects in the lexeme <r PARAM n m> in case of success.
+#
+#     In order to be independant of the end-user language, the following implementation
+#     uses the embedded LUA interpreter to manage all events.
+#
+# :default event-action => ::lua->lua_event_action
 
-# ----------------------
-# White Space Characters
-# ----------------------
-<s space>                     ::= S_SPACE
-<s tab>                       ::= [\x{9}]  /* TAB */
-<s white>                     ::= <s space>
-                                | <s tab>
-<ns char>                     ::= [\x{1F}\x{21}-\x{7E}\x{85}\x{A0}-\x{D7FF}\x{E000}-\x{FEFE}\x{FF00}\x{FFFD}\x{10000}-\x{10FFFF}]:u # <nb char> - <s white>
+#
+# Chapter 5. Characters
+# =====================
 
+#
+# 5.1. Character Set
+# ------------------
+<c printable> ::= /[\x{9}\x{A}\x{D}\x{20}-\x{7E}\x{85}\x{A0}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]/u
+<nb json>     ::= /[\x{9}\x{20}-\x{10FFFF}]/u
+
+#
+# 5.2. Character Encodings
 # ------------------------
-# Miscellaneous Characters
-# ------------------------
-<ns dec digit>                ::= [\x{30}-\x{39}] /* 0-9 */
-<ns hex digit>                ::= <ns dec digit>
-                                | [\x{41}-\x{46}] /* A-F */
-                                | [\x{61}-\x{66}] /* a-f */
-<ns ascii letter>             ::= [\x{41}-\x{5A}] /* A-Z */
-                                | [\x{61}-\x{7A}] /* a-z */
-<ns word char>                ::= <ns dec digit>
-                                | <ns ascii letter>
-                                | "-"
-<ns uri char>                 ::= "%" <ns hex digit> <ns hex digit>
-                                | <ns word char>
-                                | [#;/?:@&=+$,_.!~*'()[]]
-
-<ns tag char>                 ::= "%" <ns hex digit> <ns hex digit>
-                                | <ns word char>
-                                | [#;/?:@&=+$_.~*'()] # <ns uri char> - "!" - <c flow indicator>
-# ------------------
-# Escaped Characters
-# ------------------
-<c escape>                    ::= "\\"
-<ns esc null>                 ::= "0"
-<ns esc bell>                 ::= "a"
-<ns esc backspace>            ::= "b"
-<ns esc horizontal tab>       ::= "t"
-                                | [\x{9}]
-<ns esc line feed>            ::= "n"
-<ns esc vertical tab>         ::= "v"
-<ns esc form feed>            ::= "f"
-<ns esc carriage return>      ::= "r"
-<ns esc escape>               ::= "e"
-<ns esc space>                ::= [\x{20}]
-<ns esc double quote>         ::= '"'
-<ns esc slash>                ::= "/"
-<ns esc backslash>            ::= "\\"
-<ns esc next line>            ::= "N"
-<ns esc non breaking space>   ::= "_"
-<ns esc line separator>       ::= "L"
-<ns esc paragraph separator>  ::= "P"
-<ns esc 8 bit>                ::= "x" <ns hex digit> <ns hex digit>
-<ns esc 16 bit>               ::= "u" <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit>
-<ns esc 32 bit>               ::= "U" <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit>
-<c ns esc char>               ::= "\\" <ns esc null>
-                                | "\\" <ns esc bell>
-                                | "\\" <ns esc backspace>
-                                | "\\" <ns esc horizontal tab>
-                                | "\\" <ns esc line feed>
-                                | "\\" <ns esc vertical tab>
-                                | "\\" <ns esc form feed>
-                                | "\\" <ns esc carriage return>
-                                | "\\" <ns esc escape>
-                                | "\\" <ns esc space>
-                                | "\\" <ns esc double quote>
-                                | "\\" <ns esc slash>
-                                | "\\" <ns esc backslash>
-                                | "\\" <ns esc next line>
-                                | "\\" <ns esc non breaking space>
-                                | "\\" <ns esc line separator>
-                                | "\\" <ns esc paragraph separator>
-                                | "\\" <ns esc 8 bit>
-                                | "\\" <ns esc 16 bit>
-                                | "\\" <ns esc 32 bit>
-
-# ------------------
-# Indentation Spaces
-# ------------------
 #
-# Parameterized rules are not supported by ESLIF.
-# Anyway it is exactly here that YAML grammar is not context-free
-# so callbacks to user-space are (and must be) used.
+# Note: no-op with ESLIF that handle natively encodings
 #
-event ^s_indent_n    = predicted <s indent n>
-event ^s_indent_lt_n = predicted <s indent lt n>
-event ^s_indent_le_n = predicted <s indent le n>
+<c byte order mark> ::= /\x{FEFF}/u
 
-<s indent n>                  ::= S_SPACE_N          # s-space × n
-<s indent lt n>               ::= S_SPACE_LT_N       # s-space × m /* Where m < n */ 
-<s indent le n>               ::= S_SPACE_LE_N       # s-space × m /* Where m <= n */
-
-# -----------------
-# Separation Spaces
-# -----------------
 #
+# 5.3. Indicator Characters
+# -------------------------
+<c sequence entry> ::= “-”
+<c mapping key>    ::= “?”
+<c mapping value>  ::= “:”
+<c collect entry>  ::= “,”
+<c sequence start> ::= “[”
+<c sequence end>   ::= “]”
+<c mapping start>  ::= “{”
+<c mapping end>    ::= “}”
+<c comment>        ::= “#”
+<c anchor>         ::= “&”
+<c alias>          ::= “*”
+<c tag>            ::= “!”
+<c literal>        ::= “|”
+<c folded>         ::= “>”
+<c single quote>   ::= “'”
+<c double quote>   ::= “"”
+<c directive>      ::= “%”
+<c reserved>       ::= “@”
+                     | “`”
+<c indicator>      ::= “-”
+                     | “?”
+                     | “:”
+                     | “,”
+                     | “[”
+                     | “]”
+                     | “{”
+                     | “}”
+                     | “#”
+                     | “&”
+                     | “*”
+                     | “!”
+                     | “|”
+                     | “>”
+                     | “'”
+                     | “"”
+                     | “%”
+                     | “@”
+                     | “`”
+<c flow indicator> ::= “,”
+                     | “[”
+                     | “]”
+                     | “{”
+                     | “}”
+
+#
+# 5.4. Line Break Characters
+# --------------------------
+<b line feed>       ::= /\x{A}/ /* LF */
+<b carriage return> ::= /\x{D}/ /* CR */
+<b char>            ::= <b line feed>
+                      | <b carriage return>
+# <nb-char          ::= <c printable> - <b char> - <c byte order mark>
+<nb char>           ::= /[\x{9}\x{20}-\x{7E}\x{85}\x{A0}-\x{D7FF}\x{E000}-\x{FEFE}\x{FF00}-\x{FFFD}\x{10000}-\x{10FFFF}]/u
+<b break>           ::= <b carriage return> <b line feed> /* DOS, Windows */
+                      | <b carriage return>               /* MacOS upto 9.x */
+                      | <b line feed>                     /* UNIX, MacOS X */
+<b as line feed>    ::= <b break>
+<b non content>     ::= <b break>
+
+#
+# 5.5. White Space Characters
+# ---------------------------
+<s space>   ::= <S SPACE>
+<s tab>     ::= <S TAB>
+<s white>   ::= <s space>
+              | <s tab>
+# <ns char> ::= <nb char> - <s white>
+<ns char>   ::= /[\x{21}-\x{7E}\x{85}\x{A0}-\x{D7FF}\x{E000}-\x{FEFE}\x{FF00}-\x{FFFD}\x{10000}-\x{10FFFF}]/u
+
+#
+# 5.6. Miscellaneous Characters
+# -----------------------------
+<ns dec digit>    ::= /[\x{30}-\x{39}]/ /* 0-9 */
+<ns hex digit>    ::= <ns dec digit>
+                    | /[\x{41}-\x{46}]/ /* A-F */
+                    | /[\x{61}-\x{66}]/ /* a-f */
+<ns ascii letter> ::= /[\x{41}-\x{5A}]/ /* A-Z */
+                    | /[\x{61}-\x{7A}]/ /* a-z */
+<ns word char>    ::= <ns dec digit>
+                    | <ns ascii letter>
+                    | “-”
+
+<ns uri char>     ::= “%” <ns hex digit> <ns hex digit>
+                    | <ns word char>
+                    | “#”
+                    | “;”
+                    | “/”
+                    | “?”
+                    | “:”
+                    | “@”
+                    | “&”
+                    | “=”
+                    | “+”
+                    | “$”
+                    | “,”
+                    | “_”
+                    | “.”
+                    | “!”
+                    | “~”
+                    | “*”
+                    | “'”
+                    | “(”
+                    | “)”
+                    | “[”
+                    | “]”
+# <ns tag char>     ::= <ns uri char> - “!” - c-flow-indicator
+<ns tag char>       ::= “%” <ns hex digit> <ns hex digit>
+                    | <ns word char>
+                    | “#”
+                    | “;”
+                    | “/”
+                    | “?”
+                    | “:”
+                    | “@”
+                    | “&”
+                    | “=”
+                    | “+”
+                    | “$”
+                    | “_”
+                    | “.”
+                    | “~”
+                    | “*”
+                    | “'”
+                    | “(”
+                    | “)”
+
+#
+# 5.7. Escaped Characters
+# -----------------------
+<c escape>                   ::= “\\”
+<ns esc null>                ::= “0”
+<ns esc bell>                ::= “a”
+<ns esc backspace>           ::= “b”
+<ns esc horizontal tab>      ::= “t”
+                               | /\x{9}/
+<ns esc line feed>           ::= “n”
+<ns esc vertical tab>        ::= “v”
+<ns esc form feed>           ::= “f”
+<ns esc carriage return>     ::= “r”
+<ns esc escape>              ::= “e”
+<ns esc space>               ::= /\x{20}/
+<ns esc double quote>        ::= “"”
+<ns esc slash>               ::= “/”
+<ns esc backslash>           ::= “\\”
+<ns esc next line>           ::= “N”
+<ns esc non breaking space>  ::= “_”
+<ns esc line separator>      ::= “L”
+<ns esc paragraph separator> ::= “P”
+<ns esc 8 bit>               ::= “x” <ns hex digit> <ns hex digit>
+<ns esc 16 bit>              ::= “u” <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit>
+<ns esc 32 bit>              ::= “U” <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit> <ns hex digit>
+<c ns esc char>              ::= “\\” <ns esc null>
+                               | “\\” <ns esc bell>
+                               | “\\” <ns esc backspace>
+                               | “\\” <ns esc horizontal tab>
+                               | “\\” <ns esc line feed>
+                               | “\\” <ns esc vertical tab>
+                               | “\\” <ns esc form feed>
+                               | “\\” <ns esc carriage return>
+                               | “\\” <ns esc escape>
+                               | “\\” <ns esc space>
+                               | “\\” <ns esc double quote>
+                               | “\\” <ns esc slash>
+                               | “\\” <ns esc backslash>
+                               | “\\” <ns esc next line>
+                               | “\\” <ns esc non breaking space>
+                               | “\\” <ns esc line separator>
+                               | “\\” <ns esc paragraph separator>
+                               | “\\” <ns esc 8 bit>
+                               | “\\” <ns esc 16 bit>
+                               | “\\” <ns esc 32 bit>
+
+#
+# Chapter 6. Basic Structures
+# ===========================
+
+#
+# 6.1. Indentation Spaces
+# -----------------------
+# <s-indent(n)>          ::= <s space> × n
+<s indent n>             ::= <s NULLABLE indent n> <s PARAM indent n>
+<s NULLABLE indent n>    ::=
+event s_indent[n]          = nulled <s NULLABLE indent n>
+
+# s-indent(<n)           ::= s-space × m /* Where m < n */ 
+<s indent lt n>          ::= <s NULLABLE indent lt n> <s PARAM indent lt n>
+<s NULLABLE indent lt n> ::=
+event s_indent_lt[n]       = nulled <s NULLABLE indent lt n>
+
+# s-indent(<=n)          ::= s-space × m /* Where m <= n */ 
+<s indent le n>          ::= <s NULLABLE indent le n> <s PARAM indent le n>
+<s NULLABLE indent le n> ::=
+event s_indent_le[n]       = nulled <s NULLABLE indent le n>
+
+#
+# 6.2. Separation Spaces
+# ----------------------
 event ^s_separate_in_line = predicted <s separate in line>
-<s separate in line>          ::= <s white many>
-                                | <start of line>
+<s separate in line> ::= <S WHITE MANY OR START OF LINE>
 
-event ^start_of_line = predicted <start of line>
-<start of line>               ::= START_OF_LINE
+#
+# 6.3. Line Prefixes
+# ------------------
+# s-line-prefix(n,c)         ::= c = block-out ⇒ s-block-line-prefix(n)
+#                                c = block-in  ⇒ s-block-line-prefix(n)
+#                                c = flow-out  ⇒ s-flow-line-prefix(n)
+#                                c = flow-in   ⇒ s-flow-line-prefix(n)
+<s line prefix n c>          ::= <s NULLABLE line prefix n c> <s PARAM line prefix n c>
+<s NULLABLE line prefix n c> ::=
+event s_line_prefix[n][c]      = nulled <s NULLABLE line prefix n c>
 
-# -------------
-# Line Prefixes
-# -------------
-event ^s_line_prefix_n_block_out = predicted <s line prefix n block out>
-event ^s_line_prefix_n_block_in  = predicted <s line prefix n block in>
-event ^s_line_prefix_n_flow_out  = predicted <s line prefix n flow out>
-event ^s_line_prefix_n_flow_in   = predicted <s line prefix n flow in>
+#
+# Lexemes
+# =======
+<s PARAM indent n>              ~ [^\s\S] # Matches nothing
+<s PARAM indent lt n>           ~ [^\s\S] # Matches nothing
+<s PARAM indent le n>           ~ [^\s\S] # Matches nothing
+<S SPACE>                       ~ /\x{20}/ /* SP */
+<S TAB>                         ~ /\x{9}/  /* TAB */
+<S WHITE MANY OR START OF LINE> ~ /[\s\S]/ /* Matches nothing */
+<s PARAM line prefix n c>       ~ /[\s\S]/ /* Matches nothing */
 
-<s line prefix n block out>   ::= <s block line prefix n>
-<s line prefix n block in>    ::= <s block line prefix n>
-<s line prefix n flow out>    ::= <s flow line prefix n>
-<s line prefix n flow in>     ::= <s flow line prefix n>
+#
+# Lua script
+# ==========
+<luascript>
+-----------------------------------------------------------
+function input(n)
+-----------------------------------------------------------
 
-<s block line prefix n>       ::= <s indent n>
-<s flow line prefix n>        ::= <s indent n>
-                                | <s indent n> <s separate in line>
+  -- This function returns current input, ensuring there
+  -- are at least n bytes
 
-# -----------
-# Empty Lines
-# -----------
-<l empty n block out>         ::= <s line prefix n block out> <b as line feed>
-                                | <s indent lt n>             <b as line feed>
-<l empty n block in>          ::= <s line prefix n block in>  <b as line feed>
-                                | <s indent lt n>             <b as line feed>
-<l empty n flow out>          ::= <s line prefix n flow out>  <b as line feed>
-                                | <s indent lt n>             <b as line feed>
-<l empty n flow in>           ::= <s line prefix n flow in>   <b as line feed>
-                                | <s indent lt n>             <b as line feed>
+  input = marpaESLIFRecognizer:input()
+  if (input ~= nil) then
+    while (input.len < n) do
+      if (not marpaESLIFRecognizer.read()) then
+        return nil
+      end
+      input = marpaESLIFRecognizer:input()
+      if (input == nil) then
+        return nil
+      end
+    end
+  end
 
-# ------------
-# Line Folding
-# ------------
-<b l trimmed n block out>     ::= <b non content> <l empty n block out many>
-<b l trimmed n block in>      ::= <b non content> <l empty n block in many>
-<b l trimmed n flow out>      ::= <b non content> <l empty n flow out many>
-<b l trimmed n flow in>       ::= <b non content> <l empty n flow in many>
+  return input
+end
 
-<b as space>                  ::= <b break>
+-----------------------------------------------------------
+function s_indent(m, lexeme_name)
+-----------------------------------------------------------
+  rc = nil
+  
+  input = input(m)
+  if (input ~= nil) then
+    value = string.rep(' ', m)
+    if (input:sub(1,m) == value) then
+      if ((lexeme_name ~= nil) and (not marpaESLIFRecognizer:lexemeRead(lexeme_name, value, m))) then
+        error(lexeme_name..' lexeme read failure')
+      else
+        rc = value
+      end
+    end
+  end
 
-<b l folded n block out>      ::= <b l trimmed n block out>
-                                | <b as space>
-<b l folded n block in>       ::= <b l trimmed n block in>
-                                | <b as space>
-<b l folded n flow out>       ::= <b l trimmed n flow out>
-                                | <b as space>
-<b l folded n flow in>        ::= <b l trimmed n flow in>
-                                | <b as space>
+  return rc
+end
 
-<s flow folded n>             ::= <s separate in line> <b l folded n flow in> <s flow line prefix n>
-                                |                      <b l folded n flow in> <s flow line prefix n>
+-----------------------------------------------------------
+function s_indent_lt(n, lexeme_name)
+-----------------------------------------------------------
+  rc = nil
+  
+  for m=n-1,1,-1 do
+    input = input(m)
+    if (input ~= nil) then
+      value = string.rep(' ', m)
+      if (input:sub(1,m) == value) then
+        if ((lexeme_name ~= nil) and (not marpaESLIFRecognizer:lexemeRead(lexeme_name, value, m))) then
+          error(lexeme_name..' lexeme read failure')
+        else
+          rc = value
+        end
+      end
+    end
+  end
 
-# --------
-# Comments
-# --------
-<c nb comment text>           ::= "#" <nb char any>
-<b comment>                   ::= <b non content>
-                                | <end of file>
+  return rc
+end
 
-event ^end_of_file = predicted <end of file>
-<end of file>                 ::= END_OF_FILE
+-----------------------------------------------------------
+function s_indent_le(n, lexeme_name)
+-----------------------------------------------------------
+  rc = nil
+  
+  for m=n,1,-1 do
+    input = input(m)
+    if (input ~= nil) then
+      value = string.rep(' ', m)
+      if (input:sub(1,m) == value) then
+        if ((lexeme_name ~= nil) and (not marpaESLIFRecognizer:lexemeRead(lexeme_name, value, m))) then
+          error(lexeme_name..' lexeme read failure')
+        else
+          rc = value
+        end
+      end
+    end
+  end
 
-<s b comment>                 ::=                                          <b comment>
-                                | <s separate in line>                     <b comment>
-                                | <s separate in line> <c nb comment text> <b comment>
-<l comment>                   ::= <s separate in line>                     <b comment>
-                                | <s separate in line> <c nb comment text> <b comment>
-<s l comments>                ::= <s b comment>   <l comment any>
-                                | <start of line> <l comment any>
+  return rc
+end
 
-# ----------------
-# Separation Lines
-# ----------------
-<s separate n block out>     ::= <s separate lines n>
-<s separate n block in>      ::= <s separate lines n>
-<s separate n flow out>      ::= <s separate lines n>
-<s separate n flow in>       ::= <s separate lines n>
-<s separate n block key>     ::= <s separate in line>
-<s separate n flow key>      ::= <s separate in line>
+-----------------------------------------------------------
+function s_separate_in_line(lexeme_name)
+-----------------------------------------------------------
+    -- We want to match <s white>+ or <start of line>
+    rc = nil
 
-<s separate lines n>         ::= <s l comments> <s flow line prefix n>
-                               | <s separate in line>
+    s_white_many_or_start_of_line = ''
+    -- First <s white>+
+    i = 1
+    while (true) do
+      input = input(i)
+      if (input ~= nil) then
+        value = input:sub(i,1)
+        if (value == ' ' or value == '\t') then
+          s_white_many_or_start_of_line = s_white_many_or_start_of_line..value
+          rc = s_white_many_or_start_of_line
+        end
+      end
+    end
+    -- Then <start of line>
+    if (rc == nil) then
+      if (marpaESLIFRecognizer:column() == 0) then
+        rc = ''
+      end
+    end
 
-# ----------
-# Directives
-# ----------
-<l directive>                ::= "%" <ns yaml directive>     <s l comments>
-                               | "%" <ns tag directive>      <s l comments>
-                               | "%" <ns reserved directive> <s l comments>
-<ns reserved directive>      ::= <ns directive name> <ns directive parameter any>
-<ns directive name>          ::= <ns char>+ 
-<ns directive parameter>     ::= <ns char>+
+    if ((lexeme_name ~= nil) and (rc ~= nil) and (not marpaESLIFRecognizer:lexemeRead(lexeme_name, rc, rc:len()))) then
+      error(lexeme_name..' lexeme read failure')
+    end
 
-# -----------------
-# "YAML" Directives
-# -----------------
-<ns yaml directive>          ::= "Y" "A" "M" "L" <s separate in line> <ns yaml version>
-<ns yaml version>            ::= <ns dec digit many> "." <ns dec digit many>
+    return rc
+end
 
-# ----------------
-# "TAG" Directives
-# ----------------
-<ns tag directive>           ::= "T" "A" "G" <s separate in line> <c tag handle> <s separate in line> <ns tag prefix>
+-----------------------------------------------------------
+function s_line_prefix(n, c, lexeme_name)
+-----------------------------------------------------------
+    rc = nil
 
-# -----------
-# Tag Handles
-# -----------
-<c tag handle>               ::= <c named tag handle>
-                               | <c secondary tag handle>
-                               | <c primary tag handle>
-<c primary tag handle>       ::= "!"
-<c secondary tag handle>     ::= "!" "!"
-<c named tag handle>         ::= "!" <ns word char any> "!"
+    if (c == block_out) then
+      rc = s_block_line_prefix(n, lexeme_name)
+    elseif (c == block_in) then
+      rc = s_block_line_prefix(n, lexeme_name)
+    elseif (c == flow_out) then
+      rc = s_flow_line_prefix(n, lexeme_name)
+    elseif (c == flow_in) then
+      rc = s_flow_line_prefix(n, lexeme_name)
+    end
 
-# ------------
-# Tag Prefixes
-# ------------
-<ns tag prefix>              ::= <c ns local tag prefix>
-                               | <ns global tag prefix>
-<c ns local tag prefix>      ::= "!" <ns uri char any>
-<ns global tag prefix>       ::= <ns tag char> <ns uri char any>
+    return rc
+end
 
-# ---------------
-# Node Properties
-# ---------------
+-----------------------------------------------------------
+function s_block_line_prefix(n, lexeme_name)
+-----------------------------------------------------------
+    return s_indent(n, lexeme_name)
+end
 
-# -----------------------------
-# Lexemes handled in user space
-# -----------------------------
-S_SPACE_N                      ~ [\s\S]             # Matches nothing: callback in user space will fill it. Depends on S_SPACE
-S_SPACE_LT_N                   ~ [\s\S]             # Matches nothing: callback in user space will fill it. Depends on S_SPACE
-S_SPACE_LE_N                   ~ [\s\S]             # Matches nothing: callback in user space will fill it. Depends on S_SPACE
-START_OF_LINE                  ~ [\s\S]             # START_OF_LINE is a zero-length lexeme. Depends on <b break> completion
-END_OF_FILE                    ~ [\s\S]             # END_OF_LINE is when all bytes are consumed and eof flag is set. Depends on recognizer.
+-----------------------------------------------------------
+function s_flow_line_prefix(n, lexeme_name)
+-----------------------------------------------------------
+    rc = s_indent(n, nil)
 
-# --------------------------------------------
-# Lexemes on which user-space callbacks depend
-# --------------------------------------------
-S_SPACE                       ~ [\x{20}] /* SP */
+    if (rc ~= nil) then
+      s_separate_in_line = s_separate_in_line(lexeme_name)
+      if (s_separate_in_line ~= nil) then
+        rc = rc..s_separate_in_line
+      end
+    end
 
-# ---------------
-# Grammar helpers
-# ---------------
-<s white many>               ::= <s white>+
-<l empty n block out many>   ::= <l empty n block out>+
-<l empty n block in many>    ::= <l empty n block in>+
-<l empty n flow out many>    ::= <l empty n flow out>+
-<l empty n flow in many>     ::= <l empty n flow in>+
-<nb char any>                ::= <nb char>*
-<l comment any>              ::= <l comment>*
-<ns directive parameter any> ::= <ns directive parameter>* separator => <s separate in line>
-<ns dec digit many>          ::= <ns dec digit>+
-<ns word char any>           ::= <ns word char>+
-<ns uri char any>            ::= <ns uri char>*
+    return rc
+end
+</luascript>
